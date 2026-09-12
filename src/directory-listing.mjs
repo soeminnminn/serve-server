@@ -1,7 +1,6 @@
 import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import nodeHttp from 'node:http';
-import HttpError from './http-error.mjs';
 import { baseStyles, listStyles } from './styles-loader.mjs';
 
 export default class DirectoryListing {
@@ -93,12 +92,12 @@ export default class DirectoryListing {
    * @param {nodeHttp.ServerResponse} res 
    * @param {string} dirPath 
    * @param {string} pathname 
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean|number>}
    */
   async send(dirPath, res, pathname) {
     try {
       if (res.destroyed || res.writableEnded) {
-        return;
+        return false;
       }
 
       await nodeFs.promises.access(dirPath);
@@ -107,7 +106,7 @@ export default class DirectoryListing {
       const dirStat = await nodeFs.promises.stat(dirPath);
 
       if (!dirStat.isDirectory()) {
-        throw new HttpError(400, '"path" is not directory.');
+        return 400;
       }
 
       const files = await nodeFs.promises.readdir(dirPath);
@@ -156,12 +155,10 @@ export default class DirectoryListing {
       res.write(html);
       res.end();
 
+      return true;
+
     } catch (err) {
-      if (err instanceof HttpError) {
-        throw err;
-      } else {
-        throw new HttpError(500, err);
-      }
+      return err.status ?? 500;
     }
   }
 }

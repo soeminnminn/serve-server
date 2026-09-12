@@ -1,7 +1,7 @@
 
 import nodeHttp from 'node:http';
 
-export default class HttpError extends Error {
+export default class HttpError {
 
   /**
    * @constructor
@@ -10,7 +10,11 @@ export default class HttpError extends Error {
    * @param {string} [code] 
    */
   constructor(status, message, code) {
-    super(HttpError.getMessage(status, message));
+    const err = new Error(this._getMessage(status, message));
+
+    Error.captureStackTrace(err, HttpError);
+
+    Object.setPrototypeOf(err, HttpError.prototype);
 
     const errStat = (status && typeof status === 'number' && status >= 400 && status <= 600) ? status : 500;
     let errCode = (!code && typeof message === 'object') ? message.name || message.code : code;
@@ -18,25 +22,33 @@ export default class HttpError extends Error {
       errCode = (nodeHttp.STATUS_CODES[errStat] || 'Unknown').replace(/[\s]/g, '_').toUpperCase();
     }
 
-    Object.defineProperty(this, 'code', {
-      get: () => errCode,
+    Object.defineProperty(err, 'code', {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: errCode,
     });
 
-    Object.defineProperty(this, 'status', {
-      get: () => errStat,
+    Object.defineProperty(err, 'status', {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: errStat,
     });
 
-    Object.defineProperty(this, 'expose', {
-      get: () => errStat < 500,
+    Object.defineProperty(err, 'expose', {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: errStat >= 400 && errStat < 500,
     });
 
     if (typeof message === 'object') {
-      for (const pKey of ['name', 'errno', 'stack']) {
-        Object.defineProperty(this, pKey, {
-          get: () => message[pKey],
-        });
-      }
+      this._redefineProperty(message, err, 'name');
+      this._redefineProperty(message, err, 'errno');
     }
+
+    return err;
   }
 
   /**
@@ -45,17 +57,43 @@ export default class HttpError extends Error {
    * @param {string|Error} message 
    * @returns {string}
    */
-  static getMessage(status, message) {
+  _getMessage(status, message) {
     if (typeof message === 'string') {
       return message;
     }
 
     const errStat = (status && typeof status === 'number' && status >= 400 && status <= 600) ? status : 500;
-    const statusMsg = nodeHttp.STATUS_CODES[errStat] || 'Unknown Error';
+    const statusMsg = nodeHttp.STATUS_CODES[errStat] ?? 'Unknown Error';
     if (typeof message === 'object') {
-      return message.message || `${errStat} ${statusMsg}`;
+      return message.message ?? `${errStat} ${statusMsg}`;
     }
 
     return `${errStat} ${statusMsg}`;
+  }
+
+  /**
+   * @private
+   * @param {object} src 
+   * @param {object} dest 
+   * @param {string} key 
+   */
+  _redefineProperty(src, dest, key) {
+    const hasOwn = ('hasOwn' in Object && typeof Object.hasOwn === 'function') ? Object.hasOwn : Object.prototype.hasOwnProperty.call;
+
+    if (hasOwn(src, key)) {
+        const descriptor = Object.getOwnPropertyDescriptor(src, key);
+
+        if (descriptor) {
+          Object.defineProperty(dest, key, descriptor);
+
+        } else {
+          Object.defineProperty(dest, key, {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: src[key],
+          });
+        }
+      }
   }
 }

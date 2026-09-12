@@ -24,41 +24,66 @@ node serve [folderpath] [-dir <folderpath>] [-p <port>] [-r <routes>]
   -r, --routes      Set the routes mappings. Format: "<path_wildcard>=<filepath>|<path_regexp>=<filepath>"
 `;
 
-class HttpError extends Error {
+class HttpError {
   constructor(status, message, code) {
-    super(HttpError.getMessage(status, message));
+    const err = new Error(this._getMessage(status, message));
+    Error.captureStackTrace(err, HttpError);
+    Object.setPrototypeOf(err, HttpError.prototype);
     const errStat = status && typeof status === "number" && status >= 400 && status <= 600 ? status : 500;
     let errCode = !code && typeof message === "object" ? message.name || message.code : code;
     if (!errCode) {
       errCode = (nodeHttp.STATUS_CODES[errStat] || "Unknown").replace(/[\s]/g, "_").toUpperCase();
     }
-    Object.defineProperty(this, "code", {
-      get: () => errCode
+    Object.defineProperty(err, "code", {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: errCode
     });
-    Object.defineProperty(this, "status", {
-      get: () => errStat
+    Object.defineProperty(err, "status", {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: errStat
     });
-    Object.defineProperty(this, "expose", {
-      get: () => errStat < 500
+    Object.defineProperty(err, "expose", {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: errStat >= 400 && errStat < 500
     });
     if (typeof message === "object") {
-      for (const pKey of ["name", "errno", "stack"]) {
-        Object.defineProperty(this, pKey, {
-          get: () => message[pKey]
-        });
-      }
+      this._redefineProperty(message, err, "name");
+      this._redefineProperty(message, err, "errno");
     }
+    return err;
   }
-  static getMessage(status, message) {
+  _getMessage(status, message) {
     if (typeof message === "string") {
       return message;
     }
     const errStat = status && typeof status === "number" && status >= 400 && status <= 600 ? status : 500;
-    const statusMsg = nodeHttp.STATUS_CODES[errStat] || "Unknown Error";
+    const statusMsg = nodeHttp.STATUS_CODES[errStat] ?? "Unknown Error";
     if (typeof message === "object") {
-      return message.message || `${errStat} ${statusMsg}`;
+      return message.message ?? `${errStat} ${statusMsg}`;
     }
     return `${errStat} ${statusMsg}`;
+  }
+  _redefineProperty(src, dest, key) {
+    const hasOwn = "hasOwn" in Object && typeof Object.hasOwn === "function" ? Object.hasOwn : Object.prototype.hasOwnProperty.call;
+    if (hasOwn(src, key)) {
+      const descriptor = Object.getOwnPropertyDescriptor(src, key);
+      if (descriptor) {
+        Object.defineProperty(dest, key, descriptor);
+      } else {
+        Object.defineProperty(dest, key, {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: src[key]
+        });
+      }
+    }
   }
 };
 
@@ -305,13 +330,13 @@ class DirectoryListing {
   async send(dirPath, res, pathname) {
     try {
       if (res.destroyed || res.writableEnded) {
-        return;
+        return false;
       }
       await nodeFs.promises.access(dirPath);
       const showUp = nodePath.normalize(nodePath.resolve(dirPath) + nodePath.sep) !== this._rootPath;
       const dirStat = await nodeFs.promises.stat(dirPath);
       if (!dirStat.isDirectory()) {
-        throw new HttpError(400, '"path" is not directory.');
+        return 400;
       }
       const files = await nodeFs.promises.readdir(dirPath);
       const fileList = [];
@@ -352,12 +377,9 @@ class DirectoryListing {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.write(html);
       res.end();
+      return true;
     } catch (err) {
-      if (err instanceof HttpError) {
-        throw err;
-      } else {
-        throw new HttpError(500, err);
-      }
+      return err.status ?? 500;
     }
   }
 };
@@ -932,18 +954,18 @@ class SendFile {
   }
   async send(filePath, req, res, options = {}) {
     const opts = this._options;
-    const path = nodePath.resolve(filePath);
     try {
       if (!filePath || typeof filePath !== "string") {
         throw new TypeError("filePath must be a string value");
       }
-      await nodeFs.promises.access(filePath, nodeFs.constants.R_OK);
+      const path = nodePath.resolve(filePath);
+      await nodeFs.promises.access(path, nodeFs.constants.R_OK);
       const stat = await nodeFs.promises.stat(path);
       if (!stat.isFile()) {
-        throw new HttpError(404);
+        return 404;
       }
       if (res.headersSent) {
-        throw new HttpError(500, "Can't set headers after they are sent.");
+        return false;
       }
       if (opts.acceptRanges && !res.getHeader("Accept-Ranges")) {
         res.setHeader("Accept-Ranges", "bytes");
@@ -971,7 +993,7 @@ class SendFile {
       }
       if (this._isConditionalGET(req)) {
         if (this._isPreconditionFailure(req, res)) {
-          throw new HttpError(412);
+          return 412;
         }
         if (this._isCachable(res) && this._isFresh(req, res)) {
           const headerNames = ["Content-Encoding", "Content-Language", "Content-Length", "Content-Range", "Content-Type"];
@@ -1034,10 +1056,9 @@ class SendFile {
       await this._stream(path, res, streamOpts);
     } catch (err) {
       if (err && ["ENOENT", "ENAMETOOLONG"].includes(err.code)) {
-        throw new HttpError(404, err);
+        return 404;
       }
-      if (err instanceof HttpError) throw err;
-      throw new HttpError(500, err);
+      return err.status ?? 500;
     }
   }
 };
@@ -1092,7 +1113,7 @@ class Routes {
             if (match) {
               const pattern = match[1];
               const path = match[2];
-              if (pattern.startsWith("//^") && pattern.endsWith("//")) {
+              if (pattern.startsWith("/^") && pattern.endsWith("/")) {
                 const source = pattern.slice(1, -1);
                 if (source) {
                   const regexp = new RegExp(source, "i");
@@ -1115,14 +1136,14 @@ class Routes {
   }
   _getPathName(req) {
     let pathname = "/";
-    const url = req.url;
+    const url = typeof req === "string" ? req : req.url;
     if (url) {
       try {
         if (url.startsWith("/")) {
           pathname = url == "/" ? "/" : url.replace(/\/+$/, "");
         } else {
-          const proto = req.headers["x-forwarded-proto"] || "https";
-          const host = req.headers["x-forwarded-host"] || req.headers.host || "example.com";
+          const proto = req.headers["x-forwarded-proto"] || "http";
+          const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
           const urlObj = new URL(req.url || "/", `${proto}://${host}`);
           pathname = urlObj.pathname;
         }
@@ -1134,13 +1155,22 @@ class Routes {
     }
     return pathname;
   }
+  async _isFileExists(path) {
+    try {
+      await nodeFs.promises.access(path, nodeFs.constants.R_OK);
+      const stat = await nodeFs.promises.stat(path);
+      return stat.isFile();
+    } catch (err) {
+      return false;
+    }
+  }
   _buildRouter() {
     const options = this._options;
     for (const route of this._routes) {
       const handler = this._createRouteHandler(route);
       this._stack.push({
         isMatch: (req) => {
-          const pathname = this.getPathName(req);
+          const pathname = this._getPathName(req);
           return route.regexp.test(pathname);
         },
         handler
@@ -1172,19 +1202,25 @@ class Routes {
         if (pathname == null) {
           throw new HttpError(400);
         }
-        let urlPath = pathname;
+        let filePath = "";
         if (!route.regexp.test(pathname)) return false;
         if (route.wildcard) {
-          const idx = pathname.lastIndexOf(route.path);
-          if (idx > -1) {
-            urlPath = pathname.slice(idx);
+          filePath = nodePath.normalize(nodePath.join(rootPath, route.path));
+          const fileExists = await this._isFileExists(filePath);
+          if (!fileExists) {
+            const parts = pathname.split("/").filter(Boolean);
+            if (parts.length == 0) return false;
+            filePath = nodePath.normalize(nodePath.join(rootPath, route.path, parts[parts.length - 1]));
           }
         } else {
-          urlPath = pathname.replace(route.regexp, route.path);
+          const urlPath = pathname.replace(route.regexp, route.path);
+          filePath = nodePath.normalize(nodePath.join(rootPath, urlPath));
         }
-        const filePath = nodePath.normalize(nodePath.join(rootPath, urlPath));
-        this._fileResponse.send(filePath, req, res);
-        return true;
+        const result = await this._fileResponse.send(filePath, req, res);
+        if (typeof result === "number") {
+          throw new HttpError(result);
+        }
+        return result === true;
       } catch (err) {
         throw this._createHttpError(err);
       }
@@ -1201,6 +1237,7 @@ class Routes {
         }
         const urlPath = nodePath.normalize(nodePath.join(rootPath, pathname));
         let filePath = null;
+        await nodeFs.promises.access(urlPath, nodeFs.constants.R_OK);
         const stat = await nodeFs.promises.stat(urlPath);
         if (stat.isFile()) {
           filePath = urlPath;
@@ -1214,8 +1251,11 @@ class Routes {
         if (!filePath) {
           throw new HttpError(404);
         }
-        await this._fileResponse.send(filePath, req, res);
-        return true;
+        const result = await this._fileResponse.send(filePath, req, res);
+        if (typeof result === "number") {
+          throw new HttpError(result);
+        }
+        return result === true;
       } catch (err) {
         throw this._createHttpError(err);
       }
@@ -1230,8 +1270,11 @@ class Routes {
           throw new HttpError(400);
         }
         const dirPath = nodePath.normalize(nodePath.join(rootPath, pathname));
-        await this._directoryListing.send(dirPath, res, pathname);
-        return true;
+        const result = await this._directoryListing.send(dirPath, res, pathname);
+        if (typeof result === "number") {
+          throw new HttpError(result);
+        }
+        return result === true;
       } catch (err) {
         throw this._createHttpError(err);
       }
@@ -1256,6 +1299,7 @@ class Routes {
     ;
   }
   errorHandler(err, res) {
+    if (res.destroyed || res.writableEnded) return;
     let content = "";
     let statusCode = 500;
     if (typeof err === "object") {
@@ -1347,6 +1391,7 @@ class Serve {
               break;
             }
           } catch (err) {
+            console.error(err);
             lastError = err;
           }
         }

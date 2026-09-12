@@ -147,7 +147,7 @@ export default class Routes {
               const pattern = match[1];
               const path = match[2];
 
-              if (pattern.startsWith('//^') && pattern.endsWith('//')) {
+              if (pattern.startsWith('/^') && pattern.endsWith('/')) {
                 const source = pattern.slice(1, -1);
                 if (source) {
                   const regexp = new RegExp(source, 'i');
@@ -174,12 +174,12 @@ export default class Routes {
 
   /**
    * @private
-   * @param {nodeHttp.IncomingMessage} req 
+   * @param {nodeHttp.IncomingMessage|string} req 
    * @returns {string|null}
    */
   _getPathName(req) {
     let pathname = '/';
-    const url = req.url;
+    const url = typeof req === 'string' ? req : req.url;
 
     if (url) {
       try {
@@ -187,8 +187,8 @@ export default class Routes {
           pathname = url == '/' ? '/' : url.replace(/\/+$/, '');
 
         } else {
-          const proto = req.headers['x-forwarded-proto'] || 'https';
-          const host = req.headers['x-forwarded-host'] || req.headers.host || 'example.com';
+          const proto = req.headers['x-forwarded-proto'] || 'http';
+          const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
 
           const urlObj = new URL(req.url || '/', `${proto}://${host}`);
           pathname = urlObj.pathname;
@@ -205,6 +205,22 @@ export default class Routes {
 
   /**
    * @private
+   * @param {string} path 
+   * @returns {Promise<boolean>}
+   */
+  async _isFileExists(path) {
+    try {
+      await nodeFs.promises.access(path, nodeFs.constants.R_OK);
+      const stat = await nodeFs.promises.stat(path);
+      return stat.isFile();
+
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * @private
    */
   _buildRouter() {
     const options = this._options;
@@ -214,7 +230,7 @@ export default class Routes {
 
       this._stack.push({
         isMatch: (req) => {
-          const pathname = this.getPathName(req);
+          const pathname = this._getPathName(req);
           return route.regexp.test(pathname);
         },
         handler
@@ -257,23 +273,31 @@ export default class Routes {
           throw new HttpError(400);
         }
 
-        let urlPath = pathname;
+        let filePath = '';
 
         if (!route.regexp.test(pathname)) return false;
 
         if (route.wildcard) {
-          const idx = pathname.lastIndexOf(route.path);
-          if (idx > -1) {
-            urlPath = pathname.slice(idx);
+          filePath = nodePath.normalize(nodePath.join(rootPath, route.path));
+
+          const fileExists = await this._isFileExists(filePath);
+          if (!fileExists) {
+            const parts = pathname.split('/').filter(Boolean);
+            if (parts.length == 0) return false;
+            filePath = nodePath.normalize(nodePath.join(rootPath, route.path, parts[parts.length - 1]));
           }
 
         } else {
-          urlPath = pathname.replace(route.regexp, route.path);
+          const urlPath = pathname.replace(route.regexp, route.path);
+          filePath = nodePath.normalize(nodePath.join(rootPath, urlPath));
+        }
+        
+        const result = await this._fileResponse.send(filePath, req, res);
+        if (typeof result === 'number') {
+          throw new HttpError(result);
         }
 
-        const filePath = nodePath.normalize(nodePath.join(rootPath, urlPath));
-        this._fileResponse.send(filePath, req, res);
-        return true;
+        return result === true;
 
       } catch (err) {
         throw this._createHttpError(err);
@@ -299,6 +323,8 @@ export default class Routes {
         const urlPath = nodePath.normalize(nodePath.join(rootPath, pathname));
         let filePath = null;
 
+        await nodeFs.promises.access(urlPath, nodeFs.constants.R_OK);
+
         const stat = await nodeFs.promises.stat(urlPath);
         if (stat.isFile()) {
           filePath = urlPath;
@@ -316,8 +342,12 @@ export default class Routes {
           throw new HttpError(404);
         }
 
-        await this._fileResponse.send(filePath, req, res);
-        return true;
+        const result = await this._fileResponse.send(filePath, req, res);
+        if (typeof result === 'number') {
+          throw new HttpError(result);
+        }
+
+        return result === true;
 
       } catch (err) {
         throw this._createHttpError(err);
@@ -341,8 +371,12 @@ export default class Routes {
 
         const dirPath = nodePath.normalize(nodePath.join(rootPath, pathname));
 
-        await this._directoryListing.send(dirPath, res, pathname);
-        return true;
+        const result = await this._directoryListing.send(dirPath, res, pathname);
+        if (typeof result === 'number') {
+          throw new HttpError(result);
+        }
+
+        return result === true;
 
       } catch (err) {
         throw this._createHttpError(err);
@@ -386,6 +420,8 @@ export default class Routes {
    * @param {nodeHttp.ServerResponse} res 
    */
   errorHandler(err, res) {
+    if (res.destroyed || res.writableEnded) return;
+
     let content = '';
     let statusCode = 500;
 

@@ -3,7 +3,6 @@ import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import nodeHttp from 'node:http';
 import MimeTypes from './mime-types.mjs';
-import HttpError from './http-error.mjs';
 
 /**
  * @typedef {object} CorsOptions
@@ -666,27 +665,28 @@ export default class SendFile {
    * @param {nodeHttp.IncomingMessage} req 
    * @param {nodeHttp.ServerResponse} res 
    * @param {nodeFs.ReadStreamOptions} [options] 
-   * @returns {Promise<boolean>}
+   * @returns {Promise<boolean|number>}
    */
   async send(filePath, req, res, options = {}) {
     const opts = this._options;
-    const path = nodePath.resolve(filePath);
 
     try {
       if (!filePath || typeof filePath !== 'string') {
         throw new TypeError("filePath must be a string value");
       }
+      
+      const path = nodePath.resolve(filePath);
 
-      await nodeFs.promises.access(filePath, nodeFs.constants.R_OK);
+      await nodeFs.promises.access(path, nodeFs.constants.R_OK);
 
       const stat = await nodeFs.promises.stat(path);
       if (!stat.isFile()) {
-        throw new HttpError(404);
+        return 404;
       }
 
       if (res.headersSent) {
         // impossible to send now
-        throw new HttpError(500, "Can't set headers after they are sent.");
+        return false;
       }
 
       // set header fields
@@ -725,7 +725,7 @@ export default class SendFile {
       // conditional GET support
       if (this._isConditionalGET(req)) {
         if (this._isPreconditionFailure(req, res)) {
-          throw new HttpError(412);
+          return 412;
         }
 
         if (this._isCachable(res) && this._isFresh(req, res)) {
@@ -823,11 +823,10 @@ export default class SendFile {
 
     } catch (err) {
       if (err && ['ENOENT', 'ENAMETOOLONG'].includes(err.code)) {
-        throw new HttpError(404, err);
+        return 404;
       }
 
-      if (err instanceof HttpError) throw err;
-      throw new HttpError(500, err);
+      return err.status ?? 500;
     }
   }
 }

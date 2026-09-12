@@ -151,8 +151,8 @@ async function transform(outText) {
       if (classMatch) {
         const className = classMatch[1];
         classMap[className] = {
-          regex: new RegExp(`_${escapeRegExp(className)}\.`, 'g'),
-          replace: `${className}.`
+          regex: new RegExp(`_${escapeRegExp(className)}([^\s])`, 'g'),
+          replace: `${className}$1`
         };
 
         lines.push(trimedLine.replace(classStart.regex, classStart.replace));

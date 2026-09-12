@@ -113,6 +113,7 @@ export default class Serve {
             }
 
           } catch (err) {
+            console.error(err);
             lastError = err;
           }
         }
