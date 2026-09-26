@@ -1,23 +1,15 @@
 import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import nodeHttp from 'node:http';
-import Routes from './routes.mjs';
 
-/**
- * @typedef {object} RouteMap
- * @property {string} pattern
- * @property {RegExp} regexp
- * @property {string} path
- * @property {boolean} wildcard
- */
+import Routes from './routes.mjs';
 
 /**
  * @typedef {object} ServeOptions
  * @property {string} [root]
  * @property {number} [port]
- * @property {boolean} [noCache]
  * @property {string[]} [defaults]
- * @property {Array<RouteMap>|string|string[]} [routes]
+ * @property {Array<{ pattern: string|RegExp, path: string }>|string|string[]} [routes]
  */
 
 export default class Serve {
@@ -99,10 +91,12 @@ export default class Serve {
    * @returns {Promise<void>}
    */
   async handle(req, res) {
+    const routes = await this._routes.ensureReady();
+
     if (!this._isResponseClosed(res)) {
       let lastError = null;
 
-      for (const route of this._routes) {
+      for (const route of routes) {
         if (route && route.isMatch(req)) {
           try {
             const handled = await route.handler(req, res);
@@ -113,15 +107,13 @@ export default class Serve {
             }
 
           } catch (err) {
-            console.error(err);
             lastError = err;
           }
         }
       }
 
       if (lastError && !this._isResponseClosed(res)) {
-        console.log(lastError);
-        this._routes.errorHandler(lastError, res);
+        routes.errorHandler(lastError, res);
       }
     }
   }

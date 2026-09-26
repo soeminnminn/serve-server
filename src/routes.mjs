@@ -1,37 +1,44 @@
 import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import nodeHttp from 'node:http';
+import { createRequire } from 'node:module';
 
 import HttpError from './http-error.mjs';
-import Wildcard from './wildcard.mjs';
 import DirectoryListing from './directory-listing.mjs';
 import SendFile from './send-file.mjs';
+import RouteMaps, { RouteMap } from './route-map.mjs';
 import { baseStyles } from './styles-loader.mjs';
-
-/**
- * @typedef {object} RouteMap
- * @property {string} pattern
- * @property {RegExp} regexp
- * @property {string} path
- * @property {boolean} wildcard
- */
 
 /**
  * @typedef {(req: nodeHttp.IncomingMessage, res: nodeHttp.ServerResponse) => Promise<boolean>} RouteHandler
  */
 
 /**
+ * @typedef {(req?: nodeHttp.IncomingMessage) => boolean} IsMatchFunction
+ */
+
+/**
+ * @typedef {object} PluginEntry
+ * @property {string} [name]
+ * @property {IsMatchFunction} [isMatch]
+ * @property {RouteHandler} [handler]
+ */
+
+/**
  * @typedef {object} RouteEntry
- * @property {(req: nodeHttp.IncomingMessage) => boolean} isMatch
+ * @property {IsMatchFunction} isMatch
  * @property {RouteHandler} handler
  */
 
 /**
  * @typedef {object} RoutesOptions
- * @property {Array<RouteMap>|string|string[]} [routes]
+ * @property {Array<{ pattern: string|RegExp, path: string }>|string|string[]} [routes]
  * @property {string[]} [defaults]
  * @property {boolean} [dirListing]
+ * @property {string} [pluginPath]
+ * @property {string[]} [plugins]
  */
+
 
 class RoutesIterator {
   /**
@@ -59,15 +66,18 @@ class RoutesIterator {
         value: this._routes[this.index++],
         done: false,
       };
-    } else {
-      return {
-        value: undefined,
-        done: true,
-      };
     }
+
+    return {
+      value: undefined,
+      done: true,
+    };
   }
 }
 
+/**
+ * @implements {ArrayLike<RouteEntry>}
+ */
 export default class Routes {
   /**
    * @constructor
@@ -92,9 +102,9 @@ export default class Routes {
 
     /**
      * @private
-     * @type {RouteMap[]}
+     * @type {RouteMaps}
      */
-    this._routes = this._parseRoutes(this._options.routes);
+    this._routes = new RouteMaps(this._options.routes);
 
     /**
      * @private
@@ -114,7 +124,11 @@ export default class Routes {
      */
     this._stack = [];
 
-    this._buildRouter();
+    /**
+     * @private
+     * @type {boolean}
+     */
+    this._isReady = false;
   }
 
   [Symbol.iterator]() {
@@ -129,47 +143,67 @@ export default class Routes {
   }
 
   /**
-   * @private
-   * @param {string|string[]} [routesMap] 
-   * @returns {Array<RouteMap>}
+   * If not ready build the router otherwise nothing to do
+   * @returns {Promise<Routes>}
    */
-  _parseRoutes(routesMap) {
-    const routeMapRe = /^([\S]+)=(.*)$/;
+  async ensureReady() {
+    if (this._isReady) return this;
 
-    if (routesMap) {
-      const arr = typeof routesMap === 'string' ? routesMap.split('|') : routesMap.slice();
+    await this._buildRouter();
 
-      return arr.filter(Boolean).reduce((t, x) => {
-        if (typeof x === 'string') {
-          try {
-            const match = routeMapRe.exec(x.trim());
-            if (match) {
-              const pattern = match[1];
-              const path = match[2];
+    this._isReady = true;
 
-              if (pattern.startsWith('/^') && pattern.endsWith('/')) {
-                const source = pattern.slice(1, -1);
-                if (source) {
-                  const regexp = new RegExp(source, 'i');
-                  t.push({ pattern, regexp: regexp, path, wildcard: false });
-                }
+    return this;
+  }
 
-              } else {
-                const wildcard = new Wildcard(pattern, { flags: 'i' });
-                t.push({ pattern, regexp: wildcard.regexp, path, wildcard: true });
-              }
-            }
-          } catch { }
+  /**
+   * @private
+   * @returns {Promise<void>}
+   */
+  async _buildRouter() {
+    const options = this._options;
 
-        } else if (typeof x === 'object') {
-          t.push(x);
-        }
+    for (const route of this._routes) {
+      const handler = this._createRouteHandler(route);
 
-        return t;
-      }, []);
+      this._stack.push({
+        isMatch: (req) => {
+          const pathname = this._getPathName(req);
+          return route.test(pathname);
+        },
+        handler
+      });
     }
 
-    return [];
+    const plugins = await this._loadPlugins();
+    for (const plugin of plugins) {
+      if (typeof plugin.handler === 'function') {
+        this._stack.push({
+          isMatch: plugin.isMatch,
+          handler: plugin.handler
+        });
+      }
+    }
+
+    const fileHandler = this._createFileHandler();
+    this._stack.push({
+      isMatch: () => true,
+      handler: fileHandler,
+    });
+
+    if (options.dirListing == true) {
+      const directoryHandler = this._createDirectoryHandler();
+      this._stack.push({
+        isMatch: () => true,
+        handler: directoryHandler,
+      });
+    }
+
+    const finalHandler = this._createFinalHandler();
+    this._stack.push({
+      isMatch: () => true,
+      handler: finalHandler,
+    });
   }
 
   /**
@@ -221,46 +255,125 @@ export default class Routes {
 
   /**
    * @private
+   * @returns {Promise<PluginEntry[]>} 
    */
-  _buildRouter() {
-    const options = this._options;
-
-    for (const route of this._routes) {
-      const handler = this._createRouteHandler(route);
-
-      this._stack.push({
-        isMatch: (req) => {
-          const pathname = this._getPathName(req);
-          return route.regexp.test(pathname);
-        },
-        handler
-      });
+  async _loadPlugins() {
+    const { pluginPath, plugins } = this._options;
+    if (!pluginPath || !plugins) {
+      return [];
     }
 
-    const fileHandler = this._createFileHandler();
-    this._stack.push({
-      isMatch: () => true,
-      handler: fileHandler,
-    });
+    const pluginFiles = [];
+    const pluginFileFormat = /^serve-([^\.]+)\.(js|cjs|mjs)$/;
+    const require = createRequire(import.meta.url);
 
-    if (options.dirListing == true) {
-      const directoryHandler = this._createDirectoryHandler();
-      this._stack.push({
-        isMatch: () => true,
-        handler: directoryHandler,
-      });
+    if (pluginPath) {
+      try {
+        const dirPath = nodePath.resolve(pluginPath);
+        await nodeFs.promises.access(dirPath, nodeFs.constants.R_OK);
+        const files = await nodeFs.promises.readdir(dirPath);
+
+        for (const file of files) {
+          const match = pluginFileFormat.exec(file.toLocaleLowerCase());
+          if (match) {
+            const filePath = nodePath.join(dirPath, file);
+            pluginFiles.push({
+              path: filePath,
+              name: match[1],
+              module: match[2] === 'mjs',
+            });
+          }
+        }
+
+      } catch (err) {
+        console.warn(err);
+      }
     }
-    
-    const finalHandler = this._createFinalHandler();
-    this._stack.push({
-      isMatch: () => true,
-      handler: finalHandler,
-    });
+
+    const result = [];
+
+    if (Array.isArray(plugins)) {
+      for (const plugin of plugins) {
+        if (typeof plugin === 'string') {
+          const fileName = nodePath.basename(plugin);
+          const ext = String.prototype.toLocaleLowerCase.call(nodePath.extname(plugin));
+
+          pluginFiles.push({
+            path: nodePath.resolve(plugin),
+            name: fileName.slice(0, -ext.length),
+            module: ext === '.mjs',
+          });
+
+        } else if (typeof plugin === 'object' && (typeof plugin.handle === 'function' || typeof plugin.handler === 'function')) {
+          const isMatch = typeof plugin.isMatch === 'function' ? plugin.isMatch.bind(plugin) : () => true;
+          let handler = null;
+
+          if (typeof plugin.handle === 'function') {
+            handler = plugin.handle.bind(plugin);
+          } else if (typeof plugin.handler === 'function') {
+            handler = plugin.handler.bind(plugin);
+          }
+
+          if (handler) {
+            result.push({ isMatch, handler });
+          }
+
+        } else if (typeof plugin === 'function') {
+          result.push({
+            isMatch: () => true,
+            handler: plugin
+          });
+        }
+      }
+    }
+
+    for (const file of pluginFiles) {
+      try {
+        await nodeFs.promises.access(file.path, nodeFs.constants.R_OK);
+
+        let plugin = null;
+        if (file.module) {
+          plugin = await import(file.path);
+        } else {
+          plugin = require(file.path);
+        }
+
+        if (!plugin) continue;
+
+        let isMatch = () => true;
+        let handler = null;
+
+        if (typeof plugin === 'function') {
+          handler = plugin;
+
+        } else {
+          if (typeof plugin.isMatch === 'function') {
+            isMatch = plugin.isMatch.bind(plugin);
+          }
+
+          if (typeof plugin.handle === 'function') {
+            handler = plugin.handle.bind(plugin);
+
+          } else if (typeof plugin.handler === 'function') {
+            handler = plugin.handler.bind(plugin);
+          }
+        }
+
+        if (handler) {
+          result.push({ name: file.name, isMatch, handler });
+        }
+
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+
+    return result;
   }
 
   /**
    * @private
-   * @param {RouteMap} [route] 
+   * @param {RouteMap} route 
    * @returns {RouteHandler}
    */
   _createRouteHandler(route) {
@@ -275,29 +388,32 @@ export default class Routes {
 
         let filePath = '';
 
-        if (!route.regexp.test(pathname)) return false;
+        if (!route.test(pathname)) return false;
+        const routePath = route.replace(pathname);
 
-        if (route.wildcard) {
-          filePath = nodePath.normalize(nodePath.join(rootPath, route.path));
-
-          const fileExists = await this._isFileExists(filePath);
-          if (!fileExists) {
-            const parts = pathname.split('/').filter(Boolean);
-            if (parts.length == 0) return false;
-            filePath = nodePath.normalize(nodePath.join(rootPath, route.path, parts[parts.length - 1]));
-          }
+        if (routePath.endsWith('/')) {
+          const parts = pathname.split('/').filter(Boolean);
+          if (parts.length == 0) return false;
+          filePath = nodePath.normalize(nodePath.join(rootPath, routePath, parts[parts.length - 1]));
 
         } else {
-          const urlPath = pathname.replace(route.regexp, route.path);
-          filePath = nodePath.normalize(nodePath.join(rootPath, urlPath));
-        }
-        
-        const result = await this._fileResponse.send(filePath, req, res);
-        if (typeof result === 'number') {
-          throw new HttpError(result);
+          filePath = nodePath.normalize(nodePath.join(rootPath, routePath));
         }
 
-        return result === true;
+        if (filePath) {
+          const isExists = await this._isFileExists(filePath);
+
+          if (isExists) {
+            const result = await this._fileResponse.send(filePath, req, res);
+            if (typeof result === 'number') {
+              throw new HttpError(result);
+            }
+
+            return result === true;
+          }
+        }
+
+        return false;
 
       } catch (err) {
         throw this._createHttpError(err);
@@ -455,8 +571,7 @@ export default class Routes {
       <meta charset=utf-8>
       <meta content=\"IE=edge\" http-equiv=X-UA-Compatible>
       <meta content=\"width=device-width,initial-scale=1\" name=\"viewport\">
-      <link rel=\"icon\" type=\"image/png\" href=\"./icon/favicon.png\">
-      <title>Serve - Error</title>
+      <title>Serve - Error ${statusCode}</title>
       <style type=\"text/css\">
       ${baseStyles}
       </style>

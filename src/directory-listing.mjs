@@ -135,7 +135,6 @@ export default class DirectoryListing {
         <meta charset=utf-8>
         <meta content=\"IE=edge\" http-equiv=X-UA-Compatible>
         <meta content=\"width=device-width,initial-scale=1\" name=\"viewport\">
-        <link rel=\"icon\" type=\"image/png\" href=\"./icon/favicon.png\">
         <title>Serve - ${pathname || '/'}</title>
         <style type=\"text/css\">
         ${baseStyles}

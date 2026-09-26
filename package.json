@@ -1,14 +1,14 @@
 {
   "name": "serve-server",
   "version": "2.0.0",
-  "description": "",
+  "description": "Simple node js static file server with directory listing and route rewrite.",
   "type": "module",
   "main": "index.mjs",
   "scripts": {
     "start": "node .",
     "serve": "node ./dist/serve .",
     "build": "node ./script/build.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node ./test.mjs"
   },
   "keywords": [],
   "author": "Soe Minn Minn",

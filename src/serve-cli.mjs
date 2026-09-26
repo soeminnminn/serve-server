@@ -1,26 +1,13 @@
 import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import Serve from './serve.mjs';
-
-const VERSION = '2.0.0';
-
-const HELP_TEXT = `
-Static file serving and directory listing.
-
-node serve [folderpath] [-dir <folderpath>] [-p <port>] [-r <routes>]
-
-  -help, --help     Shows this help message
-  -ver, --version   Displays the current version of serve
-  -dir, --dir       Set the root folder path
-  -p, --port        Set the port
-  -r, --routes      Set the routes mappings. Format: "<path_wildcard>=<filepath>|<path_regexp>=<filepath>"
-`;
+import { HELP_TEXT, VERSION } from './serve-const.mjs';
 
 /**
  * @typedef {object} SchemaEntry
- * @property {string|number|boolean} default
+ * @property {string|number|boolean} fallback
  * @property {string[]} keys
- * @property {boolean} [defaultParam]
+ * @property {boolean} [default]
  * @property {RegExp} [match]
  * @property {boolean} [flag]
  */
@@ -30,7 +17,7 @@ node serve [folderpath] [-dir <folderpath>] [-p <port>] [-r <routes>]
  * @returns {Record<string, string|number|boolean>}
  */
 function parseArgs(schema) {
-  let argv = process.argv.slice(2);
+  const argv = process.argv.slice(2);
 
   let defParam = null;
   const args = {};
@@ -39,11 +26,11 @@ function parseArgs(schema) {
   for (const k of Object.keys(schema)) {
     const schemaData = schema[k];
     if (typeof schemaData === 'object') {
-      if (schemaData.defaultParam === true) {
+      if (schemaData.default === true) {
         defParam = { key: k, match: schemaData.match };
       }
 
-      args[k] = schemaData.default;
+      args[k] = schemaData.fallback;
       for (const j in schemaData.keys) {
         keys[schemaData.keys[j]] = k;
       }
@@ -151,16 +138,16 @@ function parseEnv(root) {
   const env = parseEnv();
 
   const argsSchema = {
-    dir: { 'defaultParam': true, 'default': env.PUBLIC_DIR || env.SERVE_DIR || '.', 'keys': ['-d', '--dir'] },
-    port: { 'default': env.PORT || 3000, 'keys': ['-p', '--port'], 'match': /^[\d]+$/ },
-    routes: { 'default': env.SERVE_ROUTES || '', 'keys': ['-r', '--routes'] },
-    help: { 'default': false, 'keys': ['-help', '--help'], flag: true },
-    version: { 'default': false, 'keys': ['-ver', '--version'], flag: true },
+    dir: { default: true, fallback: env.PUBLIC_DIR || env.SERVE_DIR, keys: ['-d', '--dir'] },
+    port: { fallback: env.PORT || 3000, keys: ['-p', '--port'], match: /^[\d]+$/ },
+    routes: { fallback: env.SERVE_ROUTES || '', keys: ['-r', '--routes'] },
+    help: { fallback: false, keys: ['-?', '--help'], flag: true },
+    version: { fallback: false, keys: ['-v', '--version'], flag: true },
   };
 
   const parsedArgs = parseArgs(argsSchema);
 
-  if (parsedArgs.help == true) {
+  if (parsedArgs.help == true || !parsedArgs.dir) {
     console.log(HELP_TEXT);
 
   } else if (parsedArgs.version == true) {

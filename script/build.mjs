@@ -1,7 +1,10 @@
 import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import * as esBuild from 'esbuild';
+
 import pkg from '../package.json' with { type: 'json' };
+
+import { HELP_TEXT } from '../src/serve-const.mjs';
 
 function escapeRegExp(src) {
   let result = '';
@@ -121,19 +124,12 @@ async function transform(outText) {
     "import nodePath from 'node:path';",
     "import nodeHttp from 'node:http';",
     "import * as nodeUtil from 'node:util';",
+    "import { createRequire } from 'node:module';",
     "",
     `const VERSION = "${version}";`,
     "",
     "const HELP_TEXT = `",
-    "Static file serving and directory listing.",
-    "",
-    "node serve [folderpath] [-dir <folderpath>] [-p <port>] [-r <routes>]",
-    "",
-    "  -help, --help     Shows this help message",
-    "  -ver, --version   Displays the current version of serve",
-    "  -dir, --dir       Set the root folder path",
-    "  -p, --port        Set the port",
-    `  -r, --routes      Set the routes mappings. Format: "<path_wildcard>=<filepath>|<path_regexp>=<filepath>"`,
+    ...(HELP_TEXT.replace(/\r\n|\r/g, '\n').trim().split('\n')),
     "`;",
   ];
 
@@ -151,7 +147,7 @@ async function transform(outText) {
       if (classMatch) {
         const className = classMatch[1];
         classMap[className] = {
-          regex: new RegExp(`_${escapeRegExp(className)}([^\s])`, 'g'),
+          regex: new RegExp(`_${escapeRegExp(className)}([\\.,\\)\\]\\}\\s])`, 'g'),
           replace: `${className}$1`
         };
 

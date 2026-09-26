@@ -1,10 +1,12 @@
 import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import nodeHttp from 'node:http';
+import nodeUrl from 'node:url';
+import * as nodeUtil from 'node:util';
+import { createRequire } from 'node:module';
 
 import Template from './template.mjs';
-import MimeTypes from './mime-types.mjs';
-import Wildcard from './wildcard.mjs';
+import mimeTypes from './mimetypes.json' with { type: 'json' };
 
 /**
  * @typedef {(err: Error|undefined, req: nodeHttp.IncomingMessage|undefined, res: nodeHttp.ServerResponse|undefined) => void} NextFn
@@ -18,6 +20,14 @@ import Wildcard from './wildcard.mjs';
  * @typedef {(err: Error, req: nodeHttp.IncomingMessage, res: nodeHttp.ServerResponse, next: NextFn) => void} ErrorHandlerFn
  */
 
+/**
+ * @typedef {object} ServeOptions
+ * @property {string} [root]
+ * @property {boolean} [noCache]
+ * @property {string[]} [defaults]
+ * @property {string[]} [plugins]
+ */
+
 const TEMPLATE = `<!DOCTYPE html>
 <html>
 <head>
@@ -27,19 +37,6 @@ const TEMPLATE = `<!DOCTYPE html>
 <link rel=\"icon\" type=\"image/png\" href=\"./icon/favicon.png\">
 <title>{{: title }}</title>
 <style type=\"text/css\">
-{{: styles }}
-</style>
-</head>
-<body>
-  <div class=\"container\">
-    <div class=\"row\">
-      {{: content }}
-    </div>
-  </div>
-</body>
-</html>`;
-
-const baseStyles = `
 body { padding-top: 50px; font: 14px \"Lucida Grande\", Helvetica, Arial, sans-serif; margin: 0; }
 .container { padding-right: 15px; padding-left: 15px; margin-right: auto; margin-left: auto; }
 @media (min-width: 768px) { .container { width: 750px; } }
@@ -51,7 +48,17 @@ pre { overflow: auto; font-family: monospace, monospace; page-break-inside: avoi
 .row { margin-right: -15px; margin-left: -15px; }
 .page-title { padding-bottom: 16px; border-bottom: 1px solid #e0e0e0; }
 .image { text-align:center; padding: 9.5px; margin: 0 0 10px; border: 1px solid #ccc; border-radius: 4px; background-color: #f5f5f5; }
-`;
+{{: styles }}
+</style>
+</head>
+<body>
+  <div class=\"container\">
+    <div class=\"row\">
+      {{: content }}
+    </div>
+  </div>
+</body>
+</html>`;
 
 const listStyles = `
 ul.list { list-style: none; padding-left: 0; }
@@ -82,6 +89,29 @@ li.file-pdf::before { background-image: url("data:image/svg+xml,%3Csvg xmlns='ht
 li.file-zip::before { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' class='octicon' viewBox='0 0 12 16' version='1.1' width='12' height='16'%3E%3Cpath fill-rule='evenodd' fill='rgba(3, 47, 98, 0.5)' d='M8.5 1H1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V4.5L8.5 1zM11 14H1V2h3v1h1V2h3l3 3v9zM5 4V3h1v1H5zM4 4h1v1H4V4zm1 2V5h1v1H5zM4 6h1v1H4V6zm1 2V7h1v1H5zM4 9.28A2 2 0 0 0 3 11v1h4v-1a2 2 0 0 0-2-2V8H4v1.28zM6 10v1H4v-1h2z'%3E%3C/path%3E%3C/svg%3E"); }
 `;
 
+function mixin(dest, src, redefine) {
+  if (!dest) {
+    throw new TypeError('argument dest is required');
+  }
+  if (!src) {
+    throw new TypeError('argument src is required');
+  }
+
+  const hasOwnProperty = Object.prototype.hasOwnProperty;
+  if (redefine === false) {
+    redefine = true;
+  }
+
+  Object.getOwnPropertyNames(src).forEach((name) => {
+    if (!redefine && hasOwnProperty.call(dest, name)) {
+      return;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(src, name);
+    Object.defineProperty(dest, name, descriptor);
+  })
+  return dest;
+}
+
 /**
  * @type {ServeOptions}
  */
@@ -89,20 +119,16 @@ const options_defaults = {
   root: 'public',
   noCache: false,
   defaults: ['index.html', 'index.htm'],
-  routes: []
+  plugins: []
 };
 
-export default class Serve {
+class Serve {
   /**
    * @constructor
    * @param {ServeOptions} options 
    */
   constructor(options) {
-    const opts = Object.assign({}, options_defaults, options);
-
-    if (typeof opts.routes === 'string') {
-      opts.routes = this.parseRoutes(opts.routes);
-    }
+    const opts = mixin(options, options_defaults);
 
     const rootPath = nodePath.normalize(nodePath.join(process.cwd(), opts.root) + nodePath.sep);
     const stats = nodeFs.lstatSync(rootPath);
@@ -113,35 +139,64 @@ export default class Serve {
     this.rootPath = rootPath;
     this.defaults = opts.defaults;
     this.noCache = opts.noCache;
-    this.routes = opts.routes || [];
 
     const template = new Template(TEMPLATE);
     this.tmpl = template.compile();
 
     this.shared = {};
+    this.mimeTypes = {};
 
-    this.mimeTypes = new MimeTypes();
+    const map = mimeTypes;
+    for (const type in map) {
+      const exts = map[type];
+      for (let i = 0; i < exts.length; i++) {
+        this.mimeTypes[exts[i]] = type;
+      }
+    }
+
     this.defaultMimeType = this.mimeLookup('bin');
 
     this.stack = [];
+    this.loadPlugins(opts.plugins);
 
-    for (const route of this.routes) {
-      const handler = this.makeHandler(route);
-
-      this.stack.push({
-        isMatch: (req) => {
-          const pathname = this.getPathName(req);
-          return route.regexp.test(pathname);
-        },
-        handler
-      });
-    }
-
-    const defaultHandler = this.makeHandler();
+    const handler = this.makeHandler();
     this.stack.push({
       isMatch: () => true,
-      handler: defaultHandler,
+      handler
     });
+  }
+
+  /**
+   * @private
+   * @param {string[]} plugins 
+   * @returns {void}
+   */
+  loadPlugins(plugins) {
+    if (typeof (plugins) == 'string') {
+      plugins = [plugins];
+    }
+    if (typeof (plugins) != 'object' || !Array.isArray(plugins)) return;
+
+    for (const i in plugins) {
+      if (plugins[i] && typeof (plugins[i]) == 'string') {
+        const pluginName = `./plugin-${plugins[i]}`;
+
+        try {
+          const require = createRequire(import.meta.url);
+          const pObj = require(pluginName);
+
+          if (pObj && typeof (pObj) == 'object' && (typeof (pObj.handle) == 'function' || typeof (pObj.handler) == 'function')) {
+            this.stack.push(pObj);
+
+          } else if (typeof (pObj) == 'function') {
+            this.stack.push({
+              handler: pObj
+            });
+
+          }
+        } catch { }
+      }
+    }
   }
 
   /**
@@ -166,34 +221,6 @@ export default class Serve {
 
   /**
    * @private
-   * @param {string} routesMap 
-   * @returns {Array<RouteMap>}
-   */
-  parseRoutes(routesMap) {
-    if (typeof routesMap === 'string' && routesMap) {
-      const routeMapRe = /^([\S]+)=(.*)$/;
-
-      return routesMap.split('|').filter(Boolean).reduce((t, x) => {
-        const match = routeMapRe.exec(x.trim());
-        if (match) {
-          const pattern = match[1];
-          const path = match[2];
-          const wildcard = new Wildcard(pattern, { flags: 'i' });
-          t.push({
-            pattern,
-            regexp: wildcard.regexp,
-            path
-          });
-        }
-        return t;
-      }, []);
-    }
-
-    return [];
-  }
-
-  /**
-   * @private
    * @param {string} filePath 
    * @returns {nodeFs.Stats|null}
    */
@@ -212,7 +239,7 @@ export default class Serve {
         stat.etag = `"${stat.mtime.getTime().toString(16)}-${stat.size.toString(16)}"`;
 
         if (!this.noCache) {
-          this.shared[filePath] = stat;
+          this.shared[path] = stat;
         }
         return stat;
       }
@@ -253,6 +280,7 @@ export default class Serve {
   }
 
   /**
+   * @private
    * @param {File} a 
    * @param {File} b 
    * @returns {-1|0|1}
@@ -289,37 +317,6 @@ export default class Serve {
     return [m[d.getMonth()], ' ', d.getDate(), ', ', d.getFullYear(), " ",
     (d.getHours() % 12 || 12), ":", (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(),
       " ", d.getHours() >= 12 ? 'PM' : 'AM'].join('');
-  }
-
-  /**
-   * @private
-   * @param {nodeHttp.IncomingMessage} req 
-   * @returns {string|null}
-   */
-  getPathName(req) {
-    let pathname = '/';
-    const url = req.url;
-    
-    if (url) {
-      try {
-        if (url.startsWith('/')) {
-          pathname = url.replace(/\/+$/, '');;
-
-        } else {
-          const proto = req.headers['x-forwarded-proto'] || 'https';
-          const host = req.headers['x-forwarded-host'] || req.headers.host || 'example.com';
-
-          const urlObj = new URL(req.url || '/', `${proto}://${host}`);
-          pathname = urlObj.pathname;
-        }
-
-        if (pathname) {
-          pathname = decodeURIComponent(pathname);
-        }
-      } catch (e) { }      
-    }
-
-    return pathname;
   }
 
   /**
@@ -374,7 +371,7 @@ export default class Serve {
     }
     content += '</ul>';
 
-    const html = this.tmpl({ title: pathname, styles: baseStyles + listStyles, content });
+    const html = this.tmpl({ title: pathname, styles: listStyles, content });
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.write(html);
     res.end();
@@ -393,7 +390,7 @@ export default class Serve {
     }
 
     const info = this.fileInfo(filePath);
-    if (!info || !info.isFile()) {
+    if (!info) {
       res.end(`${filePath} not found`);
       return false;
     }
@@ -469,7 +466,7 @@ export default class Serve {
 
       const html = this.tmpl({
         title: 'Error',
-        styles: baseStyles,
+        styles: '',
         content
       });
       res.writeHead(code, {
@@ -485,9 +482,9 @@ export default class Serve {
    * @param {RouteMap} [route] 
    * @returns {HandlerFn}
    */
-  makeHandler(route) {
+  makeHandler() {
     const rootPath = this.rootPath;
-    const serve = this;
+    const self = this;
 
     const error = (code) => {
       const msg = nodeHttp.STATUS_CODES[code];
@@ -497,21 +494,21 @@ export default class Serve {
     };
 
     return (req, res, next) => {
-      const pathname = serve.getPathName(req);
-      if (pathname == null) return next(error(400));
+      let dir = null;
+      try {
+        dir = decodeURIComponent(nodeUrl.parse(req.url).pathname);
+      } catch (e) { }
 
-      let dirPath = nodePath.normalize(nodePath.join(rootPath, pathname));
-      
-      if (route && route.regexp.test(pathname)) {
-        dirPath = nodePath.normalize(nodePath.join(rootPath, route.path));
-      }
+      if (dir == null) return next(error(400));
 
+      const dirPath = nodePath.normalize(nodePath.join(rootPath, dir));
       if (!!~dirPath.indexOf('\0')) return next(error(400));
 
       if ((dirPath + nodePath.sep).substring(0, rootPath.length) !== rootPath) {
         return next(error(403));
       }
 
+      const pathname = nodeUrl.parse(req.url).pathname;
       const showUp = nodePath.normalize(nodePath.resolve(dirPath) + nodePath.sep) !== rootPath;
 
       nodeFs.stat(dirPath, (err, stat) => {
@@ -525,35 +522,21 @@ export default class Serve {
         }
 
         if (!stat.isDirectory()) {
-          return serve.handleFile(dirPath, req, res);
-
-        } else if (route) {
-          if (!pathname.includes(route.path)) {
-            return next(error(404));
-          }
-
-          const idx = pathname.lastIndexOf(route.path);
-          if (idx > -1) {
-            const filePath = nodePath.normalize(nodePath.join(rootPath, pathname.slice(idx)));
-          
-            if (serve.handleFile(filePath, req, res) !== false) {
-              return;
-            }
-          }
+          return self.handleFile(dirPath, req, res);
         }
 
         nodeFs.readdir(dirPath, (err, files) => {
           if (err) return next(err);
 
           const defs = files.filter((f) => {
-            return !!~serve.defaults.indexOf(f.toLocaleLowerCase())
+            return !!~self.defaults.indexOf(f.toLocaleLowerCase())
           });
           if (defs && defs.length) {
             const filePath = nodePath.join(dirPath, defs[0]);
-            return serve.handleFile(filePath, req, res);
+            return self.handleFile(filePath, req, res);
           }
 
-          serve.serveDirectory(res, files, dirPath, pathname, showUp);
+          self.serveDirectory(res, files, dirPath, pathname, showUp);
         });
       });
     };
@@ -570,11 +553,7 @@ export default class Serve {
 
     console.log('SERVE ' + req.method + " " + req.url);
 
-    const next = (err) => {
-      if (this.isResponseClosed(res)) {
-        return;
-      }
-
+    var next = (err) => {
       const layer = this.stack[index++];
       if (!layer) {
         if (!err) {
@@ -592,8 +571,8 @@ export default class Serve {
           return next(err);
         }
 
-        if (typeof (layer.handler) == 'function') {
-          const handler = layer.handler;
+        if (typeof (layer.handler) == 'function' || typeof (layer.handle) == 'function') {
+          const handler = layer.handler || layer.handle;
           const count = handler.length;
 
           if (err && count === 4) {
@@ -615,12 +594,126 @@ export default class Serve {
     };
     next();
   }
+}
 
-  /**
-   * @param {nodeHttp.ServerResponse} res 
-   * @returns {boolean}
-   */
-  isResponseClosed(res) {
-    return res.destroyed || res.writableEnded;
+function parseArgs(schema) {
+  const args = {};
+  const keys = {};
+  for (const i in schema) {
+    if (typeof schema[i] == 'object') {
+      args[i] = schema[i].default;
+      for (const j in schema[i].keys) {
+        keys[schema[i].keys[j]] = i;
+      }
+    }
+  }
+
+  const argv = process.argv.slice(2);
+  if (argv.length == 1) {
+    for (const i in schema) {
+      if (schema[i].match && nodeUtil.types.isRegExp(schema[i].match) && schema[i].match.test(argv[0])) {
+        args[i] = argv[0];
+        break;
+      }
+    }
+  }
+
+  return argv.reduce((acc, key, ind, self) => {
+    if (keys[key] && argv[ind + 1]) {
+      acc[keys[key]] = argv[ind + 1];
+    }
+    return acc;
+  }, args);
+}
+
+function parseEnv(root) {
+  if (!root) {
+    root = process.cwd();
+  }
+  const dotenvPath = path.resolve(root, '.env');
+
+  const encoding = 'utf8';
+  const LINE = /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)/mg;
+
+  try {
+    const obj = {};
+
+    if (nodeFs.existsSync(dotenvPath)) {
+      const src = nodeFs.readFileSync(dotenvPath, { encoding });
+
+      // Convert buffer to string
+      let lines = src.toString();
+
+      // Convert line breaks to same format
+      lines = lines.replace(/\r\n?/mg, '\n');
+
+      let match;
+      while ((match = LINE.exec(lines)) != null) {
+        const key = match[1];
+
+        // Default undefined or null to empty string
+        let value = (match[2] || '');
+
+        // Remove whitespace
+        value = value.trim();
+
+        // Check if double quoted
+        const maybeQuote = value[0];
+
+        // Remove surrounding quotes
+        value = value.replace(/^(['"`])([\s\S]*)\1$/mg, '$2');
+
+        // Expand newlines if double quoted
+        if (maybeQuote === '"') {
+          value = value.replace(/\\n/g, '\n');
+          value = value.replace(/\\r/g, '\r');
+        }
+
+        // Add to object
+        obj[key] = value;
+      }
+    }
+
+    if (process.env && typeof (process.env) == 'object') {
+      Object.keys(process.env).forEach(function (key) {
+        if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+          obj[key] = process.env[key];
+        }
+      });
+    }
+
+    return obj;
+
+  } catch (e) {
+    return { error: e };
   }
 }
+
+(function main() {
+  const env = parseEnv();
+
+  const argsSchema = {
+    port: { 'default': env.PORT || 3000, 'keys': ['-p', '--port'], 'match': /^[\d]+$/ },
+    dir: { 'default': env.PUBLIC_DIR || env.SERVE_DIR || 'public', 'keys': ['-d', '--dir'], 'match': /^[^\s]+$/ }
+  };
+
+  const parsedArgs = parseArgs(argsSchema);
+  const plugins = [];
+
+  try {
+    const serve = new Serve({
+      root: parsedArgs.dir,
+      plugins
+    });
+    const server = http.createServer(serve.handle.bind(serve));
+
+    server.listen(parsedArgs.port);
+    server.on('listening', () => {
+      const addr = server.address();
+      const bind = typeof addr === 'string' ? `pipe ${addr}` : `port ${addr.port}`;
+      console.log(`Listening on ${bind}`);
+    });
+  } catch (e) {
+    throw e;
+  }
+})();
