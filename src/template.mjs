@@ -15,7 +15,7 @@ export default class Template {
    * @returns {(data: Record<string, any>) => string}
    */
   compile(data) {
-    let code = "var p = [], print = function() { p.push.apply(p, arguments); };";
+    let code = "const p = [];";
     code += "with(obj) { p.push('";
     code += this.template.replace(/[\r\t\n]/g, " ")
       .replace(/[\']/g, "\"")

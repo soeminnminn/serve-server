@@ -213,26 +213,15 @@ export default class Routes {
    */
   _getPathName(req) {
     let pathname = '/';
-    const url = typeof req === 'string' ? req : req.url;
+    const url = typeof req === 'string' ? req : req.url ?? '/';
 
-    if (url) {
-      try {
-        if (url.startsWith('/')) {
-          pathname = url == '/' ? '/' : url.replace(/\/+$/, '');
-
-        } else {
-          const proto = req.headers['x-forwarded-proto'] || 'http';
-          const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
-
-          const urlObj = new URL(req.url || '/', `${proto}://${host}`);
-          pathname = urlObj.pathname;
-        }
-
-        if (pathname) {
-          pathname = decodeURIComponent(pathname);
-        }
-      } catch (e) { }
-    }
+    try {
+      const urlObj = new URL(url, 'http://localhost');
+      pathname = urlObj.pathname;
+      if (pathname) {
+        pathname = decodeURIComponent(pathname);
+      }
+    } catch (e) { }
 
     return pathname;
   }
@@ -432,6 +421,7 @@ export default class Routes {
     return async (req, res) => {
       try {
         const pathname = this._getPathName(req);
+
         if (pathname == null) {
           throw new HttpError(400);
         }

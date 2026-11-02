@@ -9,6 +9,7 @@ import * as nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import nodeHttp from 'node:http';
 import * as nodeUtil from 'node:util';
+import { createRequire } from 'node:module';
 
 const VERSION = "2.0.0";
 
@@ -1179,7 +1180,7 @@ class Routes {
     this._directoryListing = new DirectoryListing(rootPath);
     this._fileResponse = new SendFile();
     this._stack = [];
-    this._buildRouter();
+    this._isReady = false;
   }
   [Symbol.iterator]() {
     return new RoutesIterator(this._stack);
@@ -1187,37 +1188,13 @@ class Routes {
   get length() {
     return this._stack.length;
   }
-  _getPathName(req) {
-    let pathname = "/";
-    const url = typeof req === "string" ? req : req.url;
-    if (url) {
-      try {
-        if (url.startsWith("/")) {
-          pathname = url == "/" ? "/" : url.replace(/\/+$/, "");
-        } else {
-          const proto = req.headers["x-forwarded-proto"] || "http";
-          const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
-          const urlObj = new URL(req.url || "/", `${proto}://${host}`);
-          pathname = urlObj.pathname;
-        }
-        if (pathname) {
-          pathname = decodeURIComponent(pathname);
-        }
-      } catch (e) {
-      }
-    }
-    return pathname;
+  async ensureReady() {
+    if (this._isReady) return this;
+    await this._buildRouter();
+    this._isReady = true;
+    return this;
   }
-  async _isFileExists(path) {
-    try {
-      await nodeFs.promises.access(path, nodeFs.constants.R_OK);
-      const stat = await nodeFs.promises.stat(path);
-      return stat.isFile();
-    } catch (err) {
-      return false;
-    }
-  }
-  _buildRouter() {
+  async _buildRouter() {
     const options = this._options;
     for (const route of this._routes) {
       const handler = this._createRouteHandler(route);
@@ -1228,6 +1205,15 @@ class Routes {
         },
         handler
       });
+    }
+    const plugins = await this._loadPlugins();
+    for (const plugin of plugins) {
+      if (typeof plugin.handler === "function") {
+        this._stack.push({
+          isMatch: plugin.isMatch,
+          handler: plugin.handler
+        });
+      }
     }
     const fileHandler = this._createFileHandler();
     this._stack.push({
@@ -1246,6 +1232,119 @@ class Routes {
       isMatch: () => true,
       handler: finalHandler
     });
+  }
+  _getPathName(req) {
+    let pathname = "/";
+    const url = typeof req === "string" ? req : req.url ?? "/";
+    try {
+      const urlObj = new URL(url, "http://localhost");
+      pathname = urlObj.pathname;
+      if (pathname) {
+        pathname = decodeURIComponent(pathname);
+      }
+    } catch (e) {
+    }
+    return pathname;
+  }
+  async _isFileExists(path) {
+    try {
+      await nodeFs.promises.access(path, nodeFs.constants.R_OK);
+      const stat = await nodeFs.promises.stat(path);
+      return stat.isFile();
+    } catch (err) {
+      return false;
+    }
+  }
+  async _loadPlugins() {
+    const { pluginPath, plugins } = this._options;
+    if (!pluginPath || !plugins) {
+      return [];
+    }
+    const pluginFiles = [];
+    const pluginFileFormat = /^serve-([^\.]+)\.(js|cjs|mjs)$/;
+    const require2 = createRequire(import.meta.url);
+    if (pluginPath) {
+      try {
+        const dirPath = nodePath.resolve(pluginPath);
+        await nodeFs.promises.access(dirPath, nodeFs.constants.R_OK);
+        const files = await nodeFs.promises.readdir(dirPath);
+        for (const file of files) {
+          const match = pluginFileFormat.exec(file.toLocaleLowerCase());
+          if (match) {
+            const filePath = nodePath.join(dirPath, file);
+            pluginFiles.push({
+              path: filePath,
+              name: match[1],
+              module: match[2] === "mjs"
+            });
+          }
+        }
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+    const result = [];
+    if (Array.isArray(plugins)) {
+      for (const plugin of plugins) {
+        if (typeof plugin === "string") {
+          const fileName = nodePath.basename(plugin);
+          const ext = String.prototype.toLocaleLowerCase.call(nodePath.extname(plugin));
+          pluginFiles.push({
+            path: nodePath.resolve(plugin),
+            name: fileName.slice(0, -ext.length),
+            module: ext === ".mjs"
+          });
+        } else if (typeof plugin === "object" && (typeof plugin.handle === "function" || typeof plugin.handler === "function")) {
+          const isMatch = typeof plugin.isMatch === "function" ? plugin.isMatch.bind(plugin) : () => true;
+          let handler = null;
+          if (typeof plugin.handle === "function") {
+            handler = plugin.handle.bind(plugin);
+          } else if (typeof plugin.handler === "function") {
+            handler = plugin.handler.bind(plugin);
+          }
+          if (handler) {
+            result.push({ isMatch, handler });
+          }
+        } else if (typeof plugin === "function") {
+          result.push({
+            isMatch: () => true,
+            handler: plugin
+          });
+        }
+      }
+    }
+    for (const file of pluginFiles) {
+      try {
+        await nodeFs.promises.access(file.path, nodeFs.constants.R_OK);
+        let plugin = null;
+        if (file.module) {
+          plugin = await import(file.path);
+        } else {
+          plugin = require2(file.path);
+        }
+        if (!plugin) continue;
+        let isMatch = () => true;
+        let handler = null;
+        if (typeof plugin === "function") {
+          handler = plugin;
+        } else {
+          if (typeof plugin.isMatch === "function") {
+            isMatch = plugin.isMatch.bind(plugin);
+          }
+          if (typeof plugin.handle === "function") {
+            handler = plugin.handle.bind(plugin);
+          } else if (typeof plugin.handler === "function") {
+            handler = plugin.handler.bind(plugin);
+          }
+        }
+        if (handler) {
+          result.push({ name: file.name, isMatch, handler });
+        }
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+    return result;
   }
   _createRouteHandler(route) {
     const rootPath = this._rootPath;
@@ -1433,9 +1532,10 @@ class Serve {
     return res.destroyed || res.writableEnded;
   }
   async handle(req, res) {
+    const routes = await this._routes.ensureReady();
     if (!this._isResponseClosed(res)) {
       let lastError = null;
-      for (const route of this._routes) {
+      for (const route of routes) {
         if (route && route.isMatch(req)) {
           try {
             const handled = await route.handler(req, res);
@@ -1450,7 +1550,7 @@ class Serve {
         }
       }
       if (lastError && !this._isResponseClosed(res)) {
-        this._routes.errorHandler(lastError, res);
+        routes.errorHandler(lastError, res);
       }
     }
   }
