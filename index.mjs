@@ -14,6 +14,6 @@ import Serve from './src/serve.mjs';
     '/test=/index.html',
   ];
 
-  const serve = new Serve({ routes });
+  const serve = new Serve({ entry: '.' });
   serve.listen();
 })();

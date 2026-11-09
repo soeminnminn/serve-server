@@ -6,10 +6,13 @@ import Routes from './routes.mjs';
 
 /**
  * @typedef {object} ServeOptions
- * @property {string} [root]
+ * @property {string} [entry]
  * @property {number} [port]
  * @property {string[]} [defaults]
  * @property {Array<{ pattern: string|RegExp, path: string }>|string|string[]} [routes]
+ * @property {boolean} [dirListing]
+ * @property {string} [pluginPath]
+ * @property {string[]} [plugins]
  */
 
 export default class Serve {
@@ -18,10 +21,10 @@ export default class Serve {
    * @type {ServeOptions}
    */
   static OPTIONS_DEFAULT = {
-    root: '.',
     port: 3000,
     defaults: ['index.html', 'index.htm'],
-    routes: []
+    routes: [],
+    dirListing: true
   };
 
   /**
@@ -29,19 +32,35 @@ export default class Serve {
    * @param {ServeOptions} options 
    */
   constructor(options) {
-    const opts = Object.assign({}, Serve.OPTIONS_DEFAULT, options);
+    const opts = Object.assign({}, Serve.OPTIONS_DEFAULT, options || {});
 
-    const rootPath = nodePath.normalize(nodePath.join(process.cwd(), opts.root) + nodePath.sep);
-    const stats = nodeFs.lstatSync(rootPath);
-    if (!stats.isDirectory()) {
-      throw new Error("'root' must be directory.");
+    let rootPath = process.cwd();
+
+    if (opts.entry && typeof opts.entry === 'string') {
+      const entryPath = nodePath.normalize(nodePath.join(process.cwd(), opts.entry));
+      const entryStats = nodeFs.lstatSync(entryPath);
+
+      if (entryStats.isDirectory()) {
+        rootPath = entryPath;
+        opts.entry = null;
+
+      } else if (entryStats.isFile()) {
+        const entryExt = nodePath.extname(entryPath).toLocaleLowerCase();
+
+        if (['.html', '.htm'].includes(entryExt)) {
+          rootPath = nodePath.dirname(entryPath);
+
+        } else {
+          throw new Error("'entry' must be folder or html file.");
+        }
+      }
     }
 
     /**
      * @private
-     * @type {ServeOptions}
+     * @type {number}
      */
-    this._options = opts;
+    this._port = opts.port || 3000;
 
     /**
      * @private
@@ -91,7 +110,12 @@ export default class Serve {
    * @returns {Promise<void>}
    */
   async handle(req, res) {
-    const routes = await this._routes.ensureReady();
+    const routes = this._routes;
+
+    if (!routes.isReady) {
+      console.error(new Error(`'Router' does not ready.`));
+      return;
+    }
 
     if (!this._isResponseClosed(res)) {
       let lastError = null;
@@ -118,11 +142,17 @@ export default class Serve {
     }
   }
 
-  listen() {
+  /**
+   * @returns {Promise<nodeHttp.Server>}
+   */
+  async listen() {
     const server = this._server;
+    const port = this._port;
 
     try {
-      server.listen(this._options.port);
+      await this._routes.build();
+
+      server.listen(port);
 
       server.on('listening', () => {
         const addr = server.address();
@@ -130,8 +160,21 @@ export default class Serve {
         console.log('Listening on %s\x1B[0m', bind);
       });
 
+      server.on('error', (e) => {
+        if (e.code === 'EADDRINUSE') {
+          console.error('Address in use, retrying...');
+          
+          setTimeout(() => {
+            server.close();
+            server.listen(port);
+          }, 1000);
+        }
+      });
+
     } catch (err) {
       console.error(err);
     }
+
+    return server;
   }
 }

@@ -138,7 +138,7 @@ function parseEnv(root) {
   const env = parseEnv();
 
   const argsSchema = {
-    dir: { default: true, fallback: env.PUBLIC_DIR || env.SERVE_DIR, keys: ['-d', '--dir'] },
+    entry: { default: true, fallback: env.SERVE_ENTRY || env.SERVE_DIR || env.PUBLIC_DIR, keys: ['-d', '--dir'] },
     port: { fallback: env.PORT || 3000, keys: ['-p', '--port'], match: /^[\d]+$/ },
     routes: { fallback: env.SERVE_ROUTES || '', keys: ['-r', '--routes'] },
     help: { fallback: false, keys: ['-?', '--help'], flag: true },
@@ -147,7 +147,7 @@ function parseEnv(root) {
 
   const parsedArgs = parseArgs(argsSchema);
 
-  if (parsedArgs.help == true || !parsedArgs.dir) {
+  if (parsedArgs.help == true || !parsedArgs.entry) {
     console.log(HELP_TEXT);
 
   } else if (parsedArgs.version == true) {
@@ -155,7 +155,7 @@ function parseEnv(root) {
 
   } else {
     const serve = new Serve({
-      root: parsedArgs.dir,
+      entry: parsedArgs.entry,
       port: parsedArgs.port,
       routes: parsedArgs.routes,
     });

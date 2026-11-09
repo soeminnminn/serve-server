@@ -217,9 +217,6 @@ async function transform(outText) {
     name: 'styles',
     setup(build) {
       build.onResolve({ filter: /styles-loader\.mjs$/ }, (args) => {
-        // return {
-        //   path: nodePath.join(process.cwd(), 'script', 'styles.mjs')
-        // };
         return {
           path: args.path,
           namespace: 'serve'
@@ -250,7 +247,6 @@ async function transform(outText) {
     write: false,
     plugins: [stylesPlugin],
   });
-
 
   try {
     const outfile = result.outputFiles[0];

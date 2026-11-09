@@ -32,6 +32,7 @@ import { baseStyles } from './styles-loader.mjs';
 
 /**
  * @typedef {object} RoutesOptions
+ * @property {string} [entry]
  * @property {Array<{ pattern: string|RegExp, path: string }>|string|string[]} [routes]
  * @property {string[]} [defaults]
  * @property {boolean} [dirListing]
@@ -85,11 +86,7 @@ export default class Routes {
    * @param {RoutesOptions} [options] 
    */
   constructor(rootPath, options) {
-    /**
-     * @private
-     * @type {RoutesOptions}
-     */
-    this._options = Object.assign({}, {
+    const opts = Object.assign({}, {
       dirListing: true,
       defaults: ['index.html', 'index.htm'],
     }, options || {});
@@ -102,21 +99,27 @@ export default class Routes {
 
     /**
      * @private
+     * @type {RoutesOptions}
+     */
+    this._options = opts;
+
+    /**
+     * @private
      * @type {RouteMaps}
      */
-    this._routes = new RouteMaps(this._options.routes);
+    this._routes = new RouteMaps(opts.routes);
 
     /**
      * @private
      * @type {DirectoryListing}
      */
-    this._directoryListing = new DirectoryListing(rootPath);
+    this._directoryListing = new DirectoryListing(rootPath, opts);
 
     /**
      * @private
      * @type {SendFile}
      */
-    this._fileResponse = new SendFile();
+    this._fileResponse = new SendFile(opts);
 
     /**
      * @private
@@ -136,6 +139,8 @@ export default class Routes {
   }
 
   /**
+   * Length of routes
+   * 
    * @returns {number}
    */
   get length() {
@@ -143,25 +148,19 @@ export default class Routes {
   }
 
   /**
-   * If not ready build the router otherwise nothing to do
-   * @returns {Promise<Routes>}
+   * Router is ready or not
+   * 
+   * @returns {boolean}
    */
-  async ensureReady() {
-    if (this._isReady) return this;
-
-    await this._buildRouter();
-
-    this._isReady = true;
-
-    return this;
+  get isReady() {
+    return this._isReady;
   }
 
   /**
-   * @private
    * @returns {Promise<void>}
    */
-  async _buildRouter() {
-    const options = this._options;
+  async build() {
+    const dirListing = this._options.dirListing === true;
 
     for (const route of this._routes) {
       const handler = this._createRouteHandler(route);
@@ -191,7 +190,7 @@ export default class Routes {
       handler: fileHandler,
     });
 
-    if (options.dirListing == true) {
+    if (dirListing) {
       const directoryHandler = this._createDirectoryHandler();
       this._stack.push({
         isMatch: () => true,
@@ -204,6 +203,8 @@ export default class Routes {
       isMatch: () => true,
       handler: finalHandler,
     });
+
+    this._isReady = true;
   }
 
   /**
@@ -213,7 +214,7 @@ export default class Routes {
    */
   _getPathName(req) {
     let pathname = '/';
-    const url = typeof req === 'string' ? req : req.url ?? '/';
+    const url = typeof req === 'string' ? req : req.url || '/';
 
     try {
       const urlObj = new URL(url, 'http://localhost');
@@ -229,13 +230,13 @@ export default class Routes {
   /**
    * @private
    * @param {string} path 
-   * @returns {Promise<boolean>}
+   * @returns {Promise<nodeFs.Stats|false>}
    */
-  async _isFileExists(path) {
+  async _getReadStats(path) {
     try {
       await nodeFs.promises.access(path, nodeFs.constants.R_OK);
       const stat = await nodeFs.promises.stat(path);
-      return stat.isFile();
+      return stat;
 
     } catch (err) {
       return false;
@@ -390,9 +391,8 @@ export default class Routes {
         }
 
         if (filePath) {
-          const isExists = await this._isFileExists(filePath);
-
-          if (isExists) {
+          const fileStats = await this._getReadStats(filePath);
+          if (fileStats && fileStats.isFile()) {
             const result = await this._fileResponse.send(filePath, req, res);
             if (typeof result === 'number') {
               throw new HttpError(result);
@@ -412,48 +412,71 @@ export default class Routes {
 
   /**
    * @private
-   * @returns {RouteHandler}
+   * @returns {Promise<RouteHandler>}
    */
   _createFileHandler() {
     const rootPath = this._rootPath;
     const options = this._options;
 
+    let entryFile = null;
+    if (options.entry && typeof options.entry === 'string') {
+      entryFile = nodePath.normalize(nodePath.join(rootPath, options.entry));
+    }
+
     return async (req, res) => {
       try {
         const pathname = this._getPathName(req);
-
         if (pathname == null) {
           throw new HttpError(400);
         }
 
-        const urlPath = nodePath.normalize(nodePath.join(rootPath, pathname));
         let filePath = null;
 
-        await nodeFs.promises.access(urlPath, nodeFs.constants.R_OK);
+        const urlPath = nodePath.normalize(nodePath.join(rootPath, pathname));
+        const pathStats = await this._getReadStats(urlPath);
 
-        const stat = await nodeFs.promises.stat(urlPath);
-        if (stat.isFile()) {
-          filePath = urlPath;
+        if (pathStats) {
+          if (pathStats.isFile()) {
+            filePath = urlPath;
 
-        } else if (stat.isDirectory()) {
-          const files = await nodeFs.promises.readdir(urlPath);
-          const defs = files.filter(f => !!~options.defaults.indexOf(f.toLocaleLowerCase()));
+          } else if (pathStats.isDirectory()) {
+            const files = await nodeFs.promises.readdir(urlPath);
+            const defs = files.filter(f => !!~options.defaults.indexOf(f.toLocaleLowerCase()));
 
-          if (defs && defs.length) {
-            filePath = nodePath.normalize(nodePath.join(urlPath, defs[0]));
+            if (defs && defs.length) {
+              filePath = nodePath.normalize(nodePath.join(urlPath, defs[0]));
+            }
           }
         }
 
-        if (!filePath) {
-          throw new HttpError(404);
+        if (!filePath && entryFile) {
+          const referrer = req.headers['referer'];
+
+          if (referrer) {
+            const referrerPath = this._getPathName(referrer || '/').replace(/[^/]+$/, '');
+            if (referrerPath.length > 1 && pathname.startsWith(referrerPath)) {
+              const noReferrer = pathname.slice(referrerPath.length - 1);
+              filePath = nodePath.normalize(nodePath.join(rootPath, noReferrer));
+            }
+
+          } else {
+            filePath = entryFile;
+          }
         }
 
-        const result = await this._fileResponse.send(filePath, req, res);
-        if (typeof result === 'number') {
-          throw new HttpError(result);
+        if (filePath) {
+          const fileStats = await this._getReadStats(filePath);
+          if (fileStats && fileStats.isFile()) {
+            const result = await this._fileResponse.send(filePath, req, res);
+            if (typeof result === 'number') {
+              throw new HttpError(result);
+            }
+
+            return result === true;
+          }
         }
 
-        return result === true;
+        return false;
 
       } catch (err) {
         throw this._createHttpError(err);

@@ -63,9 +63,9 @@ export default class HttpError {
     }
 
     const errStat = (status && typeof status === 'number' && status >= 400 && status <= 600) ? status : 500;
-    const statusMsg = nodeHttp.STATUS_CODES[errStat] ?? 'Unknown Error';
+    const statusMsg = nodeHttp.STATUS_CODES[errStat] || 'Unknown Error';
     if (typeof message === 'object') {
-      return message.message ?? `${errStat} ${statusMsg}`;
+      return message.message || `${errStat} ${statusMsg}`;
     }
 
     return `${errStat} ${statusMsg}`;

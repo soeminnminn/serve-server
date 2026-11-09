@@ -61,11 +61,23 @@ export default class SendFile {
       maxage: 0,
     }, options || {});
 
+    /**
+     * @private
+     * @type {SendFileOptions}
+     */
     this._options = opts;
 
     const maxage = this._ms(opts.maxage);
+    /**
+     * @private
+     * @type {number}
+     */
     this._maxage = !Number.isNaN(maxage) ? Math.min(Math.max(0, maxage), SendFile.MAX_MAXAGE) : 0;
 
+    /**
+     * @private
+     * @type {MimeTypes}
+     */
     this._mime = new MimeTypes(opts.mimeDbJsonPath);
   }
 
@@ -826,7 +838,7 @@ export default class SendFile {
         return 404;
       }
 
-      return err.status ?? 500;
+      return err.status || 500;
     }
   }
 }

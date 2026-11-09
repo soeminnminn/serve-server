@@ -1,10 +1,10 @@
 
-export const VERSION = '2.0.0';
+export const VERSION = 'development';
 
 export const HELP_TEXT = `
 Static file serving and directory listing.
 
-node serve [folderpath] [-dir <folderpath>] [-p <port>] [-r <routes>]
+node serve [root folder path or entry html file] [-dir <folderpath>] [-p <port>] [-r <routes>]
 
   -?, --help     Shows this help message
   -v, --version   Displays the current version of serve
